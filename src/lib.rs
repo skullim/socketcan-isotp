@@ -135,6 +135,14 @@ bitflags! {
         const CAN_ISOTP_FORCE_RXSTMIN = 0x100;
         /// different rx extended addressing
         const CAN_ISOTP_RX_EXT_ADDR = 0x200;
+        /// wait for tx completion
+        const CAN_ISOTP_WAIT_TX_DONE = 0x0400;
+        /// 1-to-N functional addressing
+        const CAN_ISOTP_SF_BROADCAST = 0x0800;
+        /// 1-to-N transmission w/o FC
+        const CAN_ISOTP_CF_BROADCAST = 0x1000;
+        /// dynamic FC parameters BS/STmin
+        const CAN_ISOTP_DYN_FC_PARMS = 0x2000;
     }
 }
 
@@ -220,7 +228,12 @@ impl IsoTpOptions {
         IsoTpBehaviour::from_bits(self.flags)
     }
 
-    /// set flags for isotp behaviour.
+    /// add the given ISO-TP behavior flags to the current flags
+    pub fn add_flags(&mut self, flags: IsoTpBehaviour) {
+        self.flags |= flags.bits();
+    }
+
+    /// replace the current ISO-TP behavior flags with the given flags
     pub fn set_flags(&mut self, flags: IsoTpBehaviour) {
         self.flags = flags.bits();
     }
@@ -412,6 +425,13 @@ pub struct IsoTpSocket {
 }
 
 impl IsoTpSocket {
+    fn new(fd: i32) -> Self {
+        Self {
+            fd,
+            recv_buffer: [0x00; RECV_BUFFER_SIZE],
+        }
+    }
+
     /// Open a named CAN ISO-TP device.
     ///
     /// Usually the more common case, opens a socket can device by name, such
@@ -479,24 +499,28 @@ impl IsoTpSocket {
         rx_flow_control_options: Option<FlowControlOptions>,
         link_layer_options: Option<LinkLayerOptions>,
     ) -> Result<Self, Error> {
-        let rx_id = match rx_id.into() {
-            Id::Standard(standard_id) => standard_id.as_raw() as u32,
-            Id::Extended(extended_id) => extended_id.as_raw() | EFF_FLAG,
-        };
-        let tx_id = match tx_id.into() {
-            Id::Standard(standard_id) => standard_id.as_raw() as u32,
-            Id::Extended(extended_id) => extended_id.as_raw() | EFF_FLAG,
-        };
         let addr = CanAddr {
             _af_can: AF_CAN,
             if_index,
-            rx_id,
-            tx_id,
+            rx_id: Self::to_raw_can_id(rx_id),
+            tx_id: Self::to_raw_can_id(tx_id),
             _pgn: 0,
             _addr: 0,
         };
 
-        // open socket
+        let sock_fd = Self::open_socket()?;
+        Self::set_socket_opts(
+            sock_fd,
+            isotp_options,
+            rx_flow_control_options,
+            link_layer_options,
+        )?;
+        Self::bind_addr(sock_fd, addr)?;
+
+        Ok(Self::new(sock_fd))
+    }
+
+    fn open_socket() -> Result<i32, Error> {
         let sock_fd;
         unsafe {
             sock_fd = socket(PF_CAN, SOCK_DGRAM, CAN_ISOTP);
@@ -505,7 +529,37 @@ impl IsoTpSocket {
         if sock_fd == -1 {
             return Err(Error::from(io::Error::last_os_error()));
         }
+        Ok(sock_fd)
+    }
 
+    fn bind_addr(sock_fd: i32, addr: CanAddr) -> Result<(), Error> {
+        let sockaddr_ptr = &addr as *const CanAddr;
+
+        let bind_rv = unsafe {
+            bind(
+                sock_fd,
+                sockaddr_ptr as *const sockaddr,
+                size_of::<CanAddr>().try_into().unwrap(),
+            )
+        };
+
+        // FIXME: on fail, close socket (do not leak socketfds)
+        if bind_rv == -1 {
+            let e = io::Error::last_os_error();
+            unsafe {
+                close(sock_fd);
+            }
+            return Err(Error::from(e));
+        }
+        Ok(())
+    }
+
+    fn set_socket_opts(
+        sock_fd: i32,
+        isotp_options: Option<IsoTpOptions>,
+        rx_flow_control_options: Option<FlowControlOptions>,
+        link_layer_options: Option<LinkLayerOptions>,
+    ) -> Result<(), Error> {
         // Set IsoTpOptions
         if let Some(isotp_options) = isotp_options {
             let isotp_options_ptr: *const c_void = &isotp_options as *const _ as *const c_void;
@@ -558,31 +612,14 @@ impl IsoTpSocket {
                 return Err(Error::from(io::Error::last_os_error()));
             }
         }
+        Ok(())
+    }
 
-        // bind it
-        let bind_rv;
-        unsafe {
-            let sockaddr_ptr = &addr as *const CanAddr;
-            bind_rv = bind(
-                sock_fd,
-                sockaddr_ptr as *const sockaddr,
-                size_of::<CanAddr>().try_into().unwrap(),
-            );
+    fn to_raw_can_id(id: impl Into<Id>) -> u32 {
+        match id.into() {
+            Id::Standard(standard_id) => standard_id.as_raw() as u32,
+            Id::Extended(extended_id) => extended_id.as_raw() | EFF_FLAG,
         }
-
-        // FIXME: on fail, close socket (do not leak socketfds)
-        if bind_rv == -1 {
-            let e = io::Error::last_os_error();
-            unsafe {
-                close(sock_fd);
-            }
-            return Err(Error::from(e));
-        }
-
-        Ok(Self {
-            fd: sock_fd,
-            recv_buffer: [0x00; RECV_BUFFER_SIZE],
-        })
     }
 
     fn close(&mut self) -> io::Result<()> {
